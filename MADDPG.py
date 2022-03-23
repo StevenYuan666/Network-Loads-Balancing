@@ -100,10 +100,8 @@ class MADDPG:
         self.tau = 0.01
 
         self.var = [1.0 for i in range(n_agents)]
-        self.critic_optimizer = [Adam(x.parameters(),
-                                      lr=0.001) for x in self.critics]
-        self.actor_optimizer = [Adam(x.parameters(),
-                                     lr=0.0001) for x in self.actors]
+        self.critic_optimizer = [Adam(x.parameters(), lr=0.0001) for x in self.critics]
+        self.actor_optimizer = [Adam(x.parameters(), lr=0.00001) for x in self.actors]
 
         if self.use_cuda:
             for x in self.actors:
@@ -203,7 +201,7 @@ class MADDPG:
             sb = state_batch[i, :].detach()
             act = self.actors[i](sb.unsqueeze(0)).squeeze()
             # '''
-            act += th.from_numpy(np.random.randn(15) * self.var[i]).type(FloatTensor)
+            act += th.from_numpy(np.random.randn(self.n_actions) * self.var[i]).type(FloatTensor)
 
             if self.episode_done > self.episodes_before_train and self.var[i] > 0.05:
                 self.var[i] *= 0.999998
@@ -213,4 +211,4 @@ class MADDPG:
         self.steps_done += 1
 
         return F.softmax(actions)
-
+        # return F.gumbel_softmax(actions)

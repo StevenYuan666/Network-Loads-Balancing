@@ -1,13 +1,68 @@
+import torch as th
+from torch.autograd import Variable
+import torch.nn as nn
+import torch.nn.functional as F
+from collections import namedtuple
 import random
+from copy import deepcopy
+from torch.optim import Adam
 import numpy as np
 import gym
+from gym.spaces import Discrete, Box
+import matplotlib.pyplot as plt
 from statistics import mean
 
-num_packets = 10000  # 一共生成多少个包
+num_packets = 1000  # 一共生成多少个包
 num_load_balancers = 4  # 均衡器的数量
-num_servers = 15  # 服务器的数量
-mean_t = 0.004
-std = 0.002
+num_servers = 8  # 服务器的数量
+
+
+class Memory:
+    def __init__(self, capacity=num_packets, lbs=num_load_balancers, servers=num_servers):
+        self.capacity = capacity
+        self.memory = []
+        self.position = 0
+
+        '''
+        self.counts = [{} for i in range(lbs)]
+        for d in self.counts:
+            for i in range(servers):
+                d[i] = 0
+        '''
+
+    def push(self, workloads, alpha):
+        if len(self.memory) < self.capacity:
+            self.memory.append(None)
+        self.memory[self.position] = [workloads, alpha]
+        self.position = (self.position + 1) % self.capacity
+        '''
+        # print(type(alpha))
+        # print(alpha)
+        for i in range(len(alpha)):
+            if alpha[i] in self.counts[i]:
+                self.counts[i][alpha[i]] += 1
+            else:
+                self.counts[i][alpha[i]] = 1
+        '''
+
+    def get_memory(self, index):
+        workload, alpha = self.memory[index]
+        return workload, alpha
+
+    def get_frequency(self):
+        # print(self.counts)
+        frequency = []
+        for d in self.counts:
+            temp = []
+            temp_sum = sum(d.values())
+            for k in d:
+                temp.append(d[k] / temp_sum)
+            frequency.append(temp)
+        # print(frequency)
+        return frequency
+
+    def __len__(self):
+        return len(self.memory)
 
 
 class Packet:
@@ -16,7 +71,6 @@ class Packet:
         self.time_received = time_received  # 每个包只保留被服务器接收的时间
         self.processing_time = processing_time  # 每个包的处理时间
         self.waiting = False
-        self.server_ip=None
 
 
 # 代表均衡器
@@ -34,13 +88,18 @@ class Server:
         self.ip = ip
         self.queue = []  # 服务器的请求队列
         self.velocity = velocity
+        self.total_load = 0
 
     def reset(self):
         self.queue.clear()  # 清空请求队列
+        self.total_load = 0
 
     def add_packet(self, packet):
-        packet.server_ip=self.ip
         self.queue.append(packet)
+        self.total_load += packet.processing_time
+
+    def get_total_load(self):
+        return self.total_load
 
     def get_mean(self):
         if len(self.queue) == 0:
@@ -66,14 +125,18 @@ class Server:
         return np.percentile(a, percentile)
 
     def get_observation(self):
-        return len(self.queue)/(num_packets / num_servers), self.get_mean()/mean_t, self.get_std()/std, self.get_percentile()/mean_t
+        return len(self.queue) / (
+                num_packets / num_servers), self.get_mean() / 0.004 / self.velocity, self.get_std() / 0.004 / self.velocity, self.get_percentile() / 0.004 / self.velocity
+
 
 class NetworkEnv(gym.Env):
-    def __init__(self, num_packets=0, num_servers=0, num_balancers=0, collaborative=True, server_velocity=None, gamma=0.9, num_clients=50):
+    def __init__(self, num_packets=0, num_servers=0, num_balancers=0, collaborative=True, server_velocity=None,
+                 gamma=0.9, num_clients=50):
 
         assert num_servers == len(server_velocity)
 
-        self.packets = [Packet(ip=random.randint(0, num_clients - 1), time_received=random.random(), processing_time=np.random.exponential(0.0004)) for i in
+        self.packets = [Packet(ip=random.randint(0, num_clients - 1), time_received=random.random(),
+                               processing_time=np.random.exponential(scale=0.004)) for i in
                         range(num_packets)]
         self.packets.sort(key=lambda x: x.time_received, reverse=False)
 
@@ -90,6 +153,7 @@ class NetworkEnv(gym.Env):
         self.gamma = gamma
         self.loads = None
         self.num_clients = num_clients
+        self.memory = Memory()
 
     def step(self, action_n):
         info = {}
@@ -105,9 +169,8 @@ class NetworkEnv(gym.Env):
         action_n = a
         packet = self.packets[self.index: self.index + self.n]
         packet.sort(key=lambda x: x.time_received, reverse=False)
-
         for i in range(len(packet)):
-            self.agents[i].distribute(self.servers[action_n[i]], packet[i])
+            self.agents[packet[i].ip % self.n].distribute(self.servers[action_n[i]], packet[i])
 
         self.index += self.n
 
@@ -122,7 +185,19 @@ class NetworkEnv(gym.Env):
             temp.append(n)
         obs = [temp] * self.n
 
-        new_loads = [self.get_stochastic_load(packets=packet, j=j, alpha=aa) for j in range(len(self.servers))]
+        workload = []
+        for lb_index in range(self.n):
+            temp = []
+            for p in packet:
+                if p.ip % self.n == lb_index:
+                    temp.append(p.processing_time)
+            workload.append(temp)
+
+        self.memory.push(workloads=workload, alpha=alpha)
+
+        new_loads = [self.get_stochastic_load(workload=workload, j=j, alpha=alpha) for j in range(len(self.servers))]
+
+        # new_loads = [self.get_deterministic_load(j=j) for j in range(len(self.servers))]
         if self.t == 0:
             reward = self.fairness(loads=new_loads)
             self.loads = new_loads
@@ -133,17 +208,18 @@ class NetworkEnv(gym.Env):
             reward = self.fairness(loads=loads)
             self.loads = new_loads
         self.t += 1
-
         return obs, [reward] * self.n, done, info
 
     def reset(self):
-        self.packets = [Packet(ip=random.randint(0, self.num_clients - 1), time_received=random.random(), processing_time=np.random.exponential(0.0004)) for i in
+        self.packets = [Packet(ip=random.randint(0, self.num_clients - 1), time_received=random.random(),
+                               processing_time=np.random.exponential(scale=0.004)) for i in
                         range(num_packets)]
         self.packets.sort(key=lambda x: x.time_received, reverse=False)
         self.time = 0  # 当前的时刻
         self.index = 0
         self.t = 0
         self.loads = None
+        self.memory = Memory()
         for s in self.servers:
             s.reset()
         temp = []
@@ -156,33 +232,23 @@ class NetworkEnv(gym.Env):
         obs = [temp] * self.n
         return obs
 
-    def get_stochastic_load(self, packets, j, alpha):
-        load_sum = 0
-        workload = []
-        for lb_index in range(self.n):
-            temp = []
-            for p in packets:
-                if p.ip % self.n == lb_index:
-                    temp.append(p.processing_time)
-            workload.append(temp)
-        for lb_index in range(self.n):
-            load_sum += sum(workload[lb_index]) * alpha[lb_index][j]
+    def get_deterministic_load(self, j):
+        load_sum = self.servers[j].get_total_load()
         return load_sum / self.servers[j].velocity
 
-    def get_deterministic_load(self, packets, j):
+    def get_stochastic_load(self, workload, j, alpha):
         load_sum = 0
-        workload = []
+
         for lb_index in range(self.n):
-            temp = []
-            for p in packets:
-                if p.ip % self.n == lb_index:
-                    temp.append(p) # 这个balancer发的包的集合
-            workload.append[temp] # 记录哪一个balancer发的这个包
-        
-        for lb_index in range(self.n):
-            for p in workload[lb_index]:
-                if p.server_ip == j:
-                    load_sum += p.processing_time
+            load_sum += sum(workload[lb_index]) * alpha[lb_index][j]
+
+        ''' 从t0开始累积
+        for t in range(len(self.memory)):
+            temp_workload, temp_alpha = self.memory.get_memory(index=t)
+            for lb_index in range(self.n):
+                load_sum += sum(temp_workload[lb_index]) * temp_alpha[lb_index][j]
+        '''
+
         return load_sum / self.servers[j].velocity
 
     def fairness(self, loads):
@@ -194,19 +260,22 @@ class NetworkEnv(gym.Env):
             product *= (loads[j] / maximum)
         return product
 
+    def calculate_alpha(self):
+        alpha = []
 
-# if __name__ == '__main__':
-    # env = NetworkEnv(num_packets=num_packets, num_servers=num_servers, num_balancers=num_load_balancers,
-    #                  collaborative=True, server_velocity=[1]*20)
-    # episodes = 10
-    # for e in range(1, episodes + 1):
-    #     state = env.reset()
-    #     done = False
-    #     score = 0  # this is the return
-    #
-    #     while not done:
-    #         action_n = th.Tensor([ [0.05]*20 for i in range(env.n)])
-    #         obs, reward, done, info = env.step(action_n)
-    #         score += reward[0]
-    #
-    #     print('Episode: {} Score: {}'.format(e, score))
+
+if __name__ == '__main__':
+    env = NetworkEnv(num_packets=num_packets, num_servers=num_servers, num_balancers=num_load_balancers,
+                     collaborative=True, server_velocity=[1, 1, 1, 1, 1, 1, 1, 1])
+    episodes = 10
+    for e in range(1, episodes + 1):
+        state = env.reset()
+        done = False
+        score = 0  # this is the return
+
+        while not done:
+            action_n = th.Tensor([[0.125, 0.125, 0.125, 0.125, 0.125, 0.125, 0.125, 0.125] for i in range(env.n)])
+            obs, reward, done, info = env.step(action_n)
+            score += sum(reward)
+
+        print('Episode: {} Score: {}'.format(e, score))
