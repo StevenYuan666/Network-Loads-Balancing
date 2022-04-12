@@ -1,0 +1,33 @@
+commit 5e08069091e07b56961c08fcb4264881301f3065
+Author: StevenYuan666 <ye.yuan3@mail.mcgill.ca>
+Date:   Tue Mar 22 22:05:30 2022 -0400
+
+    Homogeneous Results
+
+commit dac047a0862f5642e56784a59ff9b2af8cd17fc3
+Author: StevenYuan666 <ye.yuan3@mail.mcgill.ca>
+Date:   Thu Mar 17 22:23:53 2022 -0400
+
+    新改的
+
+commit 60aa5ffddf5d0225dca71efb3f2f176243580000
+Author: StevenYuan666 <ye.yuan3@mail.mcgill.ca>
+Date:   Wed Mar 16 13:38:35 2022 -0400
+
+    3.15 version
+    
+    the performance of the model is still not very well
+
+commit 494ffe84891be327f6f836eaca1c935a4ea7c83e
+Author: StevenYuan666 <ye.yuan3@mail.mcgill.ca>
+Date:   Tue Mar 15 21:21:29 2022 -0400
+
+    3.14 version
+    
+    Change the process to select an action
+
+commit 8906f4e2213ce9c672b1cfe708a832d4257527d6
+Author: Steven Yuan <68981504+StevenYuan666@users.noreply.github.com>
+Date:   Fri Mar 11 17:30:43 2022 -0500
+
+    Initial commit
