@@ -1,0 +1,591 @@
+diff --git a/DQN.py b/DQN.py
+new file mode 100644
+index 0000000..e69de29
+diff --git a/Env_PPO_DQN.py b/Env_PPO_DQN.py
+new file mode 100644
+index 0000000..9978da9
+--- /dev/null
++++ b/Env_PPO_DQN.py
+@@ -0,0 +1,287 @@
++import torch as th
++from torch.autograd import Variable
++import torch.nn as nn
++import torch.nn.functional as F
++from collections import namedtuple
++import random
++from copy import deepcopy
++from torch.optim import Adam
++import numpy as np
++import gym
++from gym.spaces import Discrete, Box, MultiDiscrete
++import matplotlib.pyplot as plt
++from statistics import mean
++
++num_packets = 1000  # 一共生成多少个包
++num_load_balancers = 4  # 均衡器的数量
++num_servers = 8  # 服务器的数量
++
++
++class Memory:
++    def __init__(self, capacity=num_packets, lbs=num_load_balancers, servers=num_servers):
++        self.capacity = capacity
++        self.memory = []
++        self.position = 0
++
++        '''
++        self.counts = [{} for i in range(lbs)]
++        for d in self.counts:
++            for i in range(servers):
++                d[i] = 0
++        '''
++
++    def push(self, workloads, alpha):
++        if len(self.memory) < self.capacity:
++            self.memory.append(None)
++        self.memory[self.position] = [workloads, alpha]
++        self.position = (self.position + 1) % self.capacity
++        '''
++        # print(type(alpha))
++        # print(alpha)
++        for i in range(len(alpha)):
++            if alpha[i] in self.counts[i]:
++                self.counts[i][alpha[i]] += 1
++            else:
++                self.counts[i][alpha[i]] = 1
++        '''
++
++    def get_memory(self, index):
++        workload, alpha = self.memory[index]
++        return workload, alpha
++
++    def get_frequency(self):
++        # print(self.counts)
++        frequency = []
++        for d in self.counts:
++            temp = []
++            temp_sum = sum(d.values())
++            for k in d:
++                temp.append(d[k] / temp_sum)
++            frequency.append(temp)
++        # print(frequency)
++        return frequency
++
++    def __len__(self):
++        return len(self.memory)
++
++
++class Packet:
++    def __init__(self, ip, time_received, processing_time):
++        self.ip = ip
++        self.time_received = time_received  # 每个包只保留被服务器接收的时间
++        self.processing_time = processing_time  # 每个包的处理时间
++        self.waiting = False
++
++
++# 代表均衡器
++class LoadBalancer:
++    def __init__(self, ip):
++        self.ip = ip
++
++    def distribute(self, server, packet):
++        return server.add_packet(packet)
++
++
++# 代表服务器，假设服务器用的是FCFS，并且是non-preemptive
++class Server:
++    def __init__(self, ip, velocity):
++        self.ip = ip
++        self.queue = []  # 服务器的请求队列
++        self.velocity = velocity
++        self.total_load = 0
++
++    def reset(self):
++        self.queue.clear()  # 清空请求队列
++        self.total_load = 0
++
++    def add_packet(self, packet):
++        self.queue.append(packet)
++        self.total_load += packet.processing_time
++
++    def get_total_load(self):
++        return self.total_load
++
++    def get_mean(self):
++        if len(self.queue) == 0:
++            return 0
++
++        return mean([p.processing_time for p in self.queue])
++
++    def get_std(self):
++        if len(self.queue) == 0:
++            return 0
++
++        l = [p.processing_time for p in self.queue]
++        mean = sum(l) / len(l)
++        variance = sum([((x - mean) ** 2) for x in l]) / len(l)
++        res = variance ** 0.5
++        return res
++
++    def get_percentile(self, percentile=90):
++        if len(self.queue) == 0:
++            return 0
++
++        a = np.array([p.processing_time for p in self.queue])
++        return np.percentile(a, percentile)
++
++    def get_observation(self):
++        return len(self.queue) / (
++                num_packets / num_servers), self.get_mean() / 0.004 / self.velocity, self.get_std() / 0.004 / self.velocity, self.get_percentile() / 0.004 / self.velocity
++
++
++class NetworkEnv(gym.Env):
++    def __init__(self, num_packets=0, num_servers=0, num_balancers=0, collaborative=True, server_velocity=None,
++                 gamma=0.9, num_clients=50):
++
++        assert num_servers == len(server_velocity)
++
++        self.packets = [Packet(ip=random.randint(0, num_clients - 1), time_received=random.random(),
++                               processing_time=np.random.exponential(scale=0.004)) for i in
++                        range(num_packets)]
++        self.packets.sort(key=lambda x: x.time_received, reverse=False)
++
++        self.server_velocity = server_velocity  # 记录所有server的最大的吞入量
++
++        self.n = num_balancers  # agents的数量，也就是均衡器的数量
++        self.shared_reward = collaborative  # 是否是合作模式
++        self.time = 0  # 当前的时刻
++        self.agents = [LoadBalancer(i) for i in range(num_balancers)]
++        self.servers = [Server(i, self.server_velocity[i]) for i in range(num_servers)]
++        self.waiting_packets = []
++        self.index = 0
++        self.t = 0
++        self.gamma = gamma
++        self.loads = None
++        self.num_clients = num_clients
++        self.memory = Memory()
++        high = np.inf * np.ones(4 * num_servers)
++        low = -high
++        self.action_space = MultiDiscrete([8, 8, 8, 8])
++        self.observation_space = Box(shape=(4 * num_servers,), low=low, high=high)
++
++    def step(self, action_n):
++        info = {}
++        aa = action_n.tolist()
++        a = []
++        index = 0
++        alpha = []
++        '''
++        for i in aa:
++            ssum = sum(i)
++            i = [(p / ssum) for p in i]
++            alpha.append(i)
++            a.append(np.random.choice(np.arange(0, len(self.servers)), p=i))
++        action_n = a
++        '''
++        packet = self.packets[self.index: self.index + self.n]
++        packet.sort(key=lambda x: x.time_received, reverse=False)
++        for i in range(len(packet)):
++            self.agents[packet[i].ip % self.n].distribute(self.servers[action_n[i]], packet[i])
++
++        self.index += self.n
++
++        done = self.index >= len(self.packets)
++
++        temp = []
++        for s in self.servers:
++            l, m, s, n = s.get_observation()
++            temp.append(l)
++            temp.append(m)
++            temp.append(s)
++            temp.append(n)
++        obs = [temp] * self.n
++
++        workload = []
++        for lb_index in range(self.n):
++            temp = []
++            for p in packet:
++                if p.ip % self.n == lb_index:
++                    temp.append(p.processing_time)
++            workload.append(temp)
++
++        self.memory.push(workloads=workload, alpha=alpha)
++
++        new_loads = [self.get_stochastic_load(workload=workload, j=j, alpha=alpha) for j in range(len(self.servers))]
++
++        # new_loads = [self.get_deterministic_load(j=j) for j in range(len(self.servers))]
++        if self.t == 0:
++            reward = self.fairness(loads=new_loads)
++            self.loads = new_loads
++        else:
++            loads = []
++            for i in range(len(self.servers)):
++                loads.append((1 - self.gamma) * self.loads[i] + self.gamma * new_loads[i])
++            reward = self.fairness(loads=loads)
++            self.loads = new_loads
++        self.t += 1
++        return np.array(obs), [reward] * self.n, done, info
++
++    def reset(self):
++        self.packets = [Packet(ip=random.randint(0, self.num_clients - 1), time_received=random.random(),
++                               processing_time=np.random.exponential(scale=0.004)) for i in
++                        range(num_packets)]
++        self.packets.sort(key=lambda x: x.time_received, reverse=False)
++        self.time = 0  # 当前的时刻
++        self.index = 0
++        self.t = 0
++        self.loads = None
++        self.memory = Memory()
++        for s in self.servers:
++            s.reset()
++        temp = []
++        for s in self.servers:
++            l, m, s, n = s.get_observation()
++            temp.append(l)
++            temp.append(m)
++            temp.append(s)
++            temp.append(n)
++        obs = [temp] * self.n
++        return np.array(obs)
++
++    def get_deterministic_load(self, j):
++        load_sum = self.servers[j].get_total_load()
++        return load_sum / self.servers[j].velocity
++
++    def get_stochastic_load(self, workload, j, alpha):
++        load_sum = 0
++
++        for lb_index in range(self.n):
++            load_sum += sum(workload[lb_index]) * alpha[lb_index][j]
++
++        ''' 从t0开始累积
++        for t in range(len(self.memory)):
++            temp_workload, temp_alpha = self.memory.get_memory(index=t)
++            for lb_index in range(self.n):
++                load_sum += sum(temp_workload[lb_index]) * temp_alpha[lb_index][j]
++        '''
++
++        return load_sum / self.servers[j].velocity
++
++    def fairness(self, loads):
++        product = 1
++        maximum = max(loads)
++        if maximum == 0:
++            return 0
++        for j in range(len(loads)):
++            product *= (loads[j] / maximum)
++        return product
++
++    def calculate_alpha(self):
++        alpha = []
++
++
++if __name__ == '__main__':
++    env = NetworkEnv(num_packets=num_packets, num_servers=num_servers, num_balancers=num_load_balancers,
++                     collaborative=True, server_velocity=[1, 1, 1, 1, 1, 1, 1, 1])
++    episodes = 10
++    for e in range(1, episodes + 1):
++        state = env.reset()
++        done = False
++        score = 0  # this is the return
++
++        while not done:
++            action_n = th.Tensor([[0.125, 0.125, 0.125, 0.125, 0.125, 0.125, 0.125, 0.125] for i in range(env.n)])
++            obs, reward, done, info = env.step(action_n)
++            score += sum(reward)
++
++        print('Episode: {} Score: {}'.format(e, score))
+diff --git a/PPO.py b/PPO.py
+new file mode 100644
+index 0000000..45a77b7
+--- /dev/null
++++ b/PPO.py
+@@ -0,0 +1,258 @@
++import argparse
++import functools
++
++import gym
++import gym.spaces
++from Env_PPO_DQN import NetworkEnv
++import numpy as np
++import torch
++from torch import nn
++
++import pfrl
++from pfrl import experiments, utils
++from pfrl.agents import PPO
++
++num_packets = 1000  # 一共生成多少个包
++num_load_balancers = 4  # 均衡器的数量
++num_servers = 8  # 服务器的数量
++
++def main():
++    import logging
++
++    parser = argparse.ArgumentParser()
++    parser.add_argument(
++        "--gpu", type=int, default=-1, help="GPU to use, set to -1 if no GPU."
++    )
++    parser.add_argument(
++        "--env",
++        type=str,
++        default="Hopper-v2",
++        help="OpenAI Gym MuJoCo env to perform algorithm on.",
++    )
++    parser.add_argument(
++        "--num-envs", type=int, default=1, help="Number of envs run in parallel."
++    )
++    parser.add_argument("--seed", type=int, default=0, help="Random seed [0, 2 ** 32)")
++    parser.add_argument(
++        "--outdir",
++        type=str,
++        default="PPO_results",
++        help=(
++            "Directory path to save output files."
++            " If it does not exist, it will be created."
++        ),
++    )
++    parser.add_argument(
++        "--steps",
++        type=int,
++        default=2 * 10**6,
++        help="Total number of timesteps to train the agent.",
++    )
++    parser.add_argument(
++        "--eval-interval",
++        type=int,
++        default=100000,
++        help="Interval in timesteps between evaluations.",
++    )
++    parser.add_argument(
++        "--eval-n-runs",
++        type=int,
++        default=100,
++        help="Number of episodes run for each evaluation.",
++    )
++    parser.add_argument(
++        "--render", action="store_true", help="Render env states in a GUI window."
++    )
++    parser.add_argument(
++        "--demo", action="store_true", help="Just run evaluation, not training."
++    )
++    parser.add_argument("--load-pretrained", action="store_true", default=False)
++    parser.add_argument(
++        "--load", type=str, default="", help="Directory to load agent from."
++    )
++    parser.add_argument(
++        "--log-level", type=int, default=logging.INFO, help="Level of the root logger."
++    )
++    parser.add_argument(
++        "--monitor", action="store_true", help="Wrap env with gym.wrappers.Monitor."
++    )
++    parser.add_argument(
++        "--log-interval",
++        type=int,
++        default=1000,
++        help="Interval in timesteps between outputting log messages during training",
++    )
++    parser.add_argument(
++        "--update-interval",
++        type=int,
++        default=2048,
++        help="Interval in timesteps between model updates.",
++    )
++    parser.add_argument(
++        "--epochs",
++        type=int,
++        default=10,
++        help="Number of epochs to update model for per PPO iteration.",
++    )
++    parser.add_argument("--batch-size", type=int, default=64, help="Minibatch size")
++    args = parser.parse_args()
++
++    logging.basicConfig(level=args.log_level)
++
++    # Set a random seed used in PFRL
++    utils.set_random_seed(args.seed)
++
++    # Set different random seeds for different subprocesses.
++    # If seed=0 and processes=4, subprocess seeds are [0, 1, 2, 3].
++    # If seed=1 and processes=4, subprocess seeds are [4, 5, 6, 7].
++    process_seeds = np.arange(args.num_envs) + args.seed * args.num_envs
++    assert process_seeds.max() < 2**32
++
++    args.outdir = experiments.prepare_output_dir(args, args.outdir)
++
++    def make_env(process_idx, test):
++        env = NetworkEnv(num_packets=num_packets, num_servers=num_servers, num_balancers=num_load_balancers,
++                     collaborative=True, server_velocity=[1, 1, 1, 1, 1, 1, 1, 1])
++        # Use different random seeds for train and test envs
++        process_seed = int(process_seeds[process_idx])
++        env_seed = 2**32 - 1 - process_seed if test else process_seed
++        env.seed(env_seed)
++        # Cast observations to float32 because our model uses float32
++        env = pfrl.wrappers.CastObservationToFloat32(env)
++        if args.monitor:
++            env = pfrl.wrappers.Monitor(env, args.outdir)
++        if args.render:
++            env = pfrl.wrappers.Render(env)
++        return env
++
++    def make_batch_env(test):
++        return pfrl.envs.MultiprocessVectorEnv(
++            [
++                functools.partial(make_env, idx, test)
++                for idx, env in enumerate(range(args.num_envs))
++            ]
++        )
++
++    # Only for getting timesteps, and obs-action spaces
++    sample_env = NetworkEnv(num_packets=num_packets, num_servers=num_servers, num_balancers=num_load_balancers,
++                     collaborative=True, server_velocity=[1, 1, 1, 1, 1, 1, 1, 1])
++    timestep_limit = 20000
++    '''
++    obs_space = sample_env.observation_space
++    action_space = sample_env.action_space
++    print("Observation space:", obs_space)
++    print("Action space:", action_space)
++    '''
++    # assert isinstance(action_space, gym.spaces.Box)
++
++    # '''
++    # Normalize observations based on their empirical mean and variance
++    obs_normalizer = pfrl.nn.EmpiricalNormalization(
++        32, clip_threshold=5
++    )
++    # '''
++    obs_size = 32
++    action_size = 32
++    policy = torch.nn.Sequential(
++        nn.Linear(obs_size, 64),
++        nn.Tanh(),
++        nn.Linear(64, 64),
++        nn.Tanh(),
++        nn.Linear(64, action_size),
++        pfrl.policies.GaussianHeadWithStateIndependentCovariance(
++            action_size=action_size,
++            var_type="diagonal",
++            var_func=lambda x: torch.exp(2 * x),  # Parameterize log std
++            var_param_init=0,  # log std = 0 => std = 1
++        ),
++    )
++
++    vf = torch.nn.Sequential(
++        nn.Linear(obs_size, 64),
++        nn.Tanh(),
++        nn.Linear(64, 64),
++        nn.Tanh(),
++        nn.Linear(64, 1),
++    )
++
++    # While the original paper initialized weights by normal distribution,
++    # we use orthogonal initialization as the latest openai/baselines does.
++    def ortho_init(layer, gain):
++        nn.init.orthogonal_(layer.weight, gain=gain)
++        nn.init.zeros_(layer.bias)
++
++    ortho_init(policy[0], gain=1)
++    ortho_init(policy[2], gain=1)
++    ortho_init(policy[4], gain=1e-2)
++    ortho_init(vf[0], gain=1)
++    ortho_init(vf[2], gain=1)
++    ortho_init(vf[4], gain=1)
++
++    # Combine a policy and a value function into a single model
++    model = pfrl.nn.Branched(policy, vf)
++
++    opt = torch.optim.Adam(model.parameters(), lr=3e-4, eps=1e-5)
++
++    agent = PPO(
++        model,
++        opt,
++        obs_normalizer=obs_normalizer,
++        gpu=args.gpu,
++        update_interval=args.update_interval,
++        minibatch_size=args.batch_size,
++        epochs=args.epochs,
++        clip_eps_vf=None,
++        entropy_coef=0,
++        standardize_advantages=True,
++        gamma=0.995,
++        lambd=0.97,
++    )
++
++    if args.load or args.load_pretrained:
++        # either load or load_pretrained must be false
++        assert not args.load or not args.load_pretrained
++        if args.load:
++            agent.load(args.load)
++        else:
++            agent.load(utils.download_model("PPO", args.env, model_type="final")[0])
++
++    if args.demo:
++        env = make_batch_env(True)
++        eval_stats = experiments.eval_performance(
++            env=env,
++            agent=agent,
++            n_steps=None,
++            n_episodes=args.eval_n_runs,
++            max_episode_len=timestep_limit,
++        )
++        print(
++            "n_runs: {} mean: {} median: {} stdev {}".format(
++                args.eval_n_runs,
++                eval_stats["mean"],
++                eval_stats["median"],
++                eval_stats["stdev"],
++            )
++        )
++        import json
++        import os
++
++        with open(os.path.join(args.outdir, "demo_scores.json"), "w") as f:
++            json.dump(eval_stats, f)
++    else:
++        experiments.train_agent_batch_with_evaluation(
++            agent=agent,
++            env=make_batch_env(False),
++            eval_env=make_batch_env(True),
++            outdir=args.outdir,
++            steps=args.steps,
++            eval_n_steps=None,
++            eval_n_episodes=args.eval_n_runs,
++            eval_interval=args.eval_interval,
++            log_interval=args.log_interval,
++            max_episode_len=timestep_limit,
++            save_best_so_far_agent=False,
++        )
++
++
++if __name__ == "__main__":
++    main()
+\ No newline at end of file
+diff --git a/__pycache__/Env.cpython-37.pyc b/__pycache__/Env.cpython-37.pyc
+index f022833..bd5a6ab 100644
+Binary files a/__pycache__/Env.cpython-37.pyc and b/__pycache__/Env.cpython-37.pyc differ
+diff --git a/a.py b/a.py
+new file mode 100644
+index 0000000..fb0aea0
+--- /dev/null
++++ b/a.py
+@@ -0,0 +1,21 @@
++import torch as th
++from torch.autograd import Variable
++import torch.nn as nn
++import torch.nn.functional as F
++from collections import namedtuple
++import random
++from copy import deepcopy
++from torch.optim import Adam
++import numpy as np
++import gym
++from gym.spaces import Discrete, Box, MultiDiscrete
++import matplotlib.pyplot as plt
++from statistics import mean
++high = np.inf * np.ones(4 * 8)
++print(high.shape)
++low = -high
++action_space = MultiDiscrete([8, 8, 8, 8])
++observation_space = Box(shape=(32,), low=low, high=high)
++
++print(action_space.sample())
++print(observation_space.sample())
