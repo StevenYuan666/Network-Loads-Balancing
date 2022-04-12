@@ -100,8 +100,8 @@ class MADDPG:
         self.tau = 0.01
 
         self.var = [1.0 for i in range(n_agents)]
-        self.critic_optimizer = [Adam(x.parameters(), lr=0.0001) for x in self.critics]
-        self.actor_optimizer = [Adam(x.parameters(), lr=0.00001) for x in self.actors]
+        self.critic_optimizer = [Adam(x.parameters(), lr=0.00001) for x in self.critics]
+        self.actor_optimizer = [Adam(x.parameters(), lr=0.000001) for x in self.actors]
 
         if self.use_cuda:
             for x in self.actors:

@@ -266,7 +266,7 @@ class NetworkEnv(gym.Env):
 
 if __name__ == '__main__':
     env = NetworkEnv(num_packets=num_packets, num_servers=num_servers, num_balancers=num_load_balancers,
-                     collaborative=True, server_velocity=[1, 1, 1, 1, 1, 1, 1, 1])
+                     collaborative=True, server_velocity=[1, 1, 1, 1, 9, 9, 9, 9])
     episodes = 10
     for e in range(1, episodes + 1):
         state = env.reset()
@@ -274,7 +274,7 @@ if __name__ == '__main__':
         score = 0  # this is the return
 
         while not done:
-            action_n = th.Tensor([[0.125, 0.125, 0.125, 0.125, 0.125, 0.125, 0.125, 0.125] for i in range(env.n)])
+            action_n = th.Tensor([[0.025, 0.025, 0.025, 0.025, 0.225, 0.225, 0.225, 0.225] for i in range(env.n)])
             obs, reward, done, info = env.step(action_n)
             score += sum(reward)
 
