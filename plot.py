@@ -1,7 +1,7 @@
 import matplotlib.pyplot as plt
 import numpy as np
 record = open("3_22_heterogeneous/3_22_reward.txt", 'r')
-baseline = open("baseline_hetro_random.txt", 'r')
+baseline = open("results/baseline_hetro_random.txt", 'r')
 
 reward = []
 for line in record.readlines():
